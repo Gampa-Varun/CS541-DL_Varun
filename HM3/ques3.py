@@ -4,28 +4,22 @@ import matplotlib.pyplot as plt
 import time
 import csv
 import json
+import numba as nb
+import time
+from concurrent.futures import  ThreadPoolExecutor
+import copy
 
 
-def dictionary_minimum (dictionary):
-
-	minvalue = float('inf')
-	k = []
-
-	for entry in dictionary.keys():
-		if dictionary[entry][0] < minvalue:
-			key = entry
-			minvalue = dictionary[entry][0]
-			
-	return key
-
-
-
+#computing the feedforward output yhat for a given set of parameters and examples
+@nb.jit(nopython=True,cache=True,nogil=True,parallel=True,fastmath=True)
 def softmax(x,W,b):
 
-	Z = x.T@W + b
-	den = np.atleast_2d(np.sum(np.exp(Z),axis=1))
+
+	Z = np.dot(x,W) + b
+
+	den = (np.sum(np.exp(Z),axis=1))
 	
-	num = np.exp(x.T@W+b.T).T
+	num = np.transpose(np.exp(Z))
 
 	probability = num/den
 
@@ -34,37 +28,47 @@ def softmax(x,W,b):
 
 #Computing  the gradient of the cost function, 
 #note that in the cost function bias is not regularised and the same suit is followed in the gradient as well
-def grad_cost_function (X, y, W, b, alpha) :
+@nb.jit(nopython=True,cache=True,nogil=True,parallel=True,fastmath=True)
+def grad_cost_function (X, y, W, b, alpha,gradW,gradb) :
+
+	
 
 	y_hat = softmax(X,W,b)
 
-	n = np.shape(y)[1]
+	n = np.int32(np.shape(y)[0])
 
-	diff = y - y_hat
+	yt = np.transpose(y)
 
-	gradW = np.zeros(np.shape(W))
+	Xt = np.transpose(X)
 
-	for i in range(np.shape(W)[1]):
-		gradW[:,i] = -np.sum(X*diff[i,:],axis=1)/n
+	diff = yt - y_hat
+
+	for i in nb.prange(np.shape(W)[1]):
+		gradW[:,i] = -np.sum(Xt*diff[i,:],axis=1)/n
 
 	gradW = gradW + alpha*W
 
 	#gradW = -np.einsum('ij,kj->ki',diff,X)/n + alpha*W // slower method, though more concise
 
-	gradb = -np.sum((y-y_hat),axis=1)/n
+	gradb = -np.sum((diff),axis=1)/n
+
 
 
 
 	return gradW,gradb
 
 #The weight vector and bias are updated based on learning rate and the gradient 
+@nb.jit(nopython=True,cache=True,nogil=True,fastmath=True)
 def parameter_update (X, y, W, b, epsilon, alpha) :
 
-	gradientW, gradientb = grad_cost_function(X,y,W,b, alpha)
+	gradW = np.zeros(np.shape(W),dtype='float32')
+	gradb = np.zeros((np.shape(y)[1]),dtype='float32')
 
-	W_new = W - epsilon*gradientW
+	gradientW, gradientb = grad_cost_function(X,y,W,b, alpha,gradW,gradb)
 
-	b_new = b - epsilon*gradientb
+	W_new = (W - epsilon*gradientW)
+
+	b_new = (b - epsilon*gradientb)
 
 	return W_new,b_new
 
@@ -72,13 +76,14 @@ def parameter_update (X, y, W, b, epsilon, alpha) :
 
 
 #MSE Cost function with regularization except on bias term 
+@nb.jit(nopython=True,cache=True,nogil=True,parallel=True)
 def cost_function (X, y, W, b, alpha) :
 
-	n = np.shape(y)[1]
+	n = (np.shape(y)[0])
 
 	y_hat = softmax(X,W,b)	
 
-	cost = -np.sum(y*np.log(y_hat))/n  + alpha*np.sum(np.einsum('ij,ij->j',W,W))
+	cost = -np.sum(y.T*np.log(y_hat))/n  + alpha*np.sum(np.square(W))
 
 
 	return cost
@@ -88,7 +93,7 @@ def cost_function (X, y, W, b, alpha) :
 
 def one_hotencoding(y):
 
-	yencode = np.zeros((np.max(y)+1,len(y)))
+	yencode = np.zeros((np.max(y)+1,np.shape(y)[0]))
 
 	columns = np.arange(len(y))
 
@@ -96,198 +101,191 @@ def one_hotencoding(y):
 
 	return yencode
 
+@nb.jit(nopython=True,nogil=True,fastmath=True,cache=True)
+def train(epsilon,alpha,total_epochs,mini_batch_size,X_tr,ytr,X_val,y_val):
+
+	np.random.seed(20)
+
+	W = np.random.normal(loc = 0.0, scale = 1.0, size = (np.shape(X_tr)[1],np.shape(ytr)[1])).astype('float32')
+
+	b = np.random.normal(loc = 0.0, scale = 1.0, size = (np.shape(ytr)[1])).astype('float32')
+	num_examples = np.shape(X_tr)[0]
+
+	for epochs in range(total_epochs) :
+
+		#Set random seed
+		np.random.seed(epochs)
+
+		indices = np.random.permutation(np.arange(num_examples))
+		X_tr_shuf = X_tr[indices,...]	
+		ytr_shuf = ytr[indices,...]	
+
+
+
+		for minibatch in range(math.floor(np.shape(X_tr)[0]/mini_batch_size)) :
+
+
+			X_minibatch = X_tr_shuf[(minibatch)*mini_batch_size:(minibatch+1)*mini_batch_size,...]
+			y_minibatch = ytr_shuf[(minibatch)*mini_batch_size:(minibatch+1)*mini_batch_size,...]
+
+			W,b = parameter_update(X_minibatch,y_minibatch,W,b,epsilon, alpha)
+
+			
+
+		costfn = cost_function(X_tr,ytr,W,b, alpha)
+		#print(epochs)
+
+	valcostfn = cost_function(X_val,y_val,W,b, alpha)
+	
+	hyper_set = np.asarray([valcostfn ,alpha,epsilon,total_epochs,mini_batch_size],dtype='float32')
+
+	return W,b,hyper_set
+
+
+@nb.jit(nopython=True,cache=True,nogil=True,fastmath=True,parallel=True)
+def learning(epsilon_set,alpha_set,epoch_lengths,mini_batch_sizes,X_tr,ytr,X_val,y_val):
+
+	num_params = len(epsilon_set)*len(alpha_set)*len(epoch_lengths)*len(mini_batch_sizes)
+	W_out = np.zeros((np.shape(X_tr)[1],np.shape(ytr)[1]), dtype='float32')
+	b_out = np.zeros((np.shape(ytr)[1]), dtype='float32') 
+	params = np.zeros((num_params,5),dtype='float32')
+	weight = np.zeros((num_params,np.shape(X_tr)[1],np.shape(ytr)[1]), dtype='float32')
+	bias = np.zeros((num_params,np.shape(ytr)[1]), dtype='float32')
+	alpha_best = 0
+	epsilon_best = 0
+	epoch_best = 0
+	batch_size_best = 0
+	valcostfn_min = 10000
+
+	for arg_epsilon in nb.prange(len(epsilon_set)):
+
+		for arg_alpha in range(len(alpha_set)):
+
+			for arg_total_epochs in range(len(epoch_lengths)):
+
+				for arg_mini_batch_size in range(len(mini_batch_sizes)):
+
+					
+					index = arg_epsilon*8 + 4*arg_alpha + 2*arg_total_epochs + arg_mini_batch_size	
+
+					mini_batch_size = mini_batch_sizes[math.floor(index%2)]
+					total_epochs = epoch_lengths[math.floor((index%4)/2)]
+					alpha = alpha_set[math.floor(((index%8)/4))]
+					epsilon = epsilon_set[math.floor(index/8)]
+
+
+
+
+					weight[index,...],bias[index,...],params[index,...] = train(epsilon,alpha,total_epochs,mini_batch_size,X_tr,ytr,X_val,y_val)
+
+
+	for arg_epsilon in range(len(epsilon_set)):
+
+		for arg_alpha in range(len(alpha_set)):
+
+			for arg_total_epochs in range(len(epoch_lengths)):
+
+				for arg_mini_batch_size in range(len(mini_batch_sizes)):		
+				
+					index = arg_epsilon*8 + 4*arg_alpha + 2*arg_total_epochs + arg_mini_batch_size			
+
+					if params[index,0]< valcostfn_min:
+						W_out = weight[index,...]
+						b_out = bias[index,...]
+						epsilon_best = params[index,1]
+						alpha_best = params[index,2]
+						epoch_best = params[index,3]
+						batch_size_best = params[index,4]
+						valcostfn_min = params[index,0]
+
+	return W_out,b_out,alpha_best,epsilon_best,epoch_best,batch_size_best
+
 
 
 def train_regressor ():
 
-	
-
 	# Load data
 
-	X_tr = np.load("fashion_mnist_train_images.npy").T
+	X_tr = np.load("fashion_mnist_train_images.npy").astype('float32')
 
 	X_tr = X_tr/255
-	ytr = (np.load("fashion_mnist_train_labels.npy"))
+	ytr = (np.load("fashion_mnist_train_labels.npy")).astype(int)
 
 	#Perform one hot encoding
-	ytr = one_hotencoding(ytr)
+	ytr = one_hotencoding(ytr).T.astype('float32')
 
 	#Seperating the validation set after permutating the examples
 
 	#Set random seed
-	np.random.seed(seed=1)
+	np.random.seed(1)
 
-	indices = np.random.permutation(range(np.shape(X_tr)[1]))
-	X_tr = X_tr[:,indices]	
-	ytr = ytr[:,indices]
+	indices = np.random.permutation(range(np.shape(X_tr)[0]))
+	X_tr = X_tr[indices,:]	
+	ytr = ytr[indices,:]
 
 
-	num_ex_val = math.floor(0.2*np.shape(X_tr)[1])
+	num_ex_val = math.floor(0.2*np.shape(X_tr)[0])
 
-	X_val = X_tr[:,-num_ex_val:]
-	X_tr = X_tr[:,0:-num_ex_val]
+	X_val = X_tr[-num_ex_val:,...].astype('float32')
+	X_tr = X_tr[0:-num_ex_val,...].astype('float32')
 
-	y_val = ytr[:,-num_ex_val:]
-	ytr = ytr[:,0:-num_ex_val]
+	y_val = ytr[-num_ex_val:,...]
+	ytr = ytr[0:-num_ex_val,...]
+
+	#print(np.shape(X_tr))
 
  	# Hyparameter sets
 
-	epsilon_set = [0.1]
+	epsilon_set = np.asarray([0.01,0.05], dtype='float32')
 
-	alpha_set = [0.0001]
+	alpha_set = np.asarray([0.001,0.01], dtype='float32')
 
-	mini_batch_sizes = [100] 
+	mini_batch_sizes = np.asarray([100,500], dtype='int') 
 
-	epoch_lengths = [100]
-
-	#####################
-	##Set up the graphs##
-	#####################
-	plt.ion()
-	figure, ax = plt.subplots(figsize=(10, 8))
-	 
-	plt.xlabel("Epochs")
-	plt.ylabel("Cost")
-	
-
-	background = figure.canvas.copy_from_bbox(ax.bbox)
-
-	plt.show(block = False)
-
-	###################### 
-	### Training starts###
-	######################
-
-	# Iterating over the hyperparameters
-
-	Costs_wrt_hyp = {}
-
-	for epsilon in epsilon_set:
-
-		for alpha in alpha_set:
-
-			for total_epochs in epoch_lengths:
-
-				for mini_batch_size in mini_batch_sizes:
-
-					#initialize weights
-					#Set random seed
-
-					np.random.seed(seed=20)
-
-					W = np.random.normal(loc = 0.0, scale = 1.0, size = [np.shape(X_tr)[0],np.shape(ytr)[0]])
-
-					b = np.random.normal(loc = 0.0, scale = 1.0, size = [np.shape(ytr)[0]])
-
-
-					costfn = cost_function(X_tr,ytr,W,b,alpha)
-
-
-					check = grad_cost_function(X_tr, ytr, W, b, alpha)
-
-					costfn_set = [costfn]
-
-					# Set x axis of graph and title
-					x = [0]
-					plt.title(str("Epochs : "+ str(total_epochs) + ", mini batch size : " + str(mini_batch_size) + ", alpha " + str(alpha) + ", epsilon : " + str(epsilon) ))
-					figure.canvas.draw()
-
-					###################### 
-					### Training starts###
-					######################
-
-
-					for epochs in range(0,total_epochs) :
-
-						#Set random seed
-						np.random.seed(seed=epochs)
-
-						indices = np.random.permutation(range(np.shape(X_tr)[1]))
-						X_tr_shuf = X_tr[:,indices]	
-						ytr_shuf = ytr[:,indices]	
+	epoch_lengths = np.asarray([50,100], dtype='int')
 
 
 
-						for minibatch in range(0,math.floor(np.shape(X_tr)[1]/mini_batch_size)) :
+	start = time.time()
+
+	W,b,alpha_best,epsilon_best,epoch_best,batch_size_best = learning(epsilon_set,alpha_set,epoch_lengths,mini_batch_sizes,X_tr,ytr,X_val,y_val)			
+
+	end = time.time()
 
 
-							X_minibatch = X_tr_shuf[:,(minibatch)*mini_batch_size:(minibatch+1)*mini_batch_size]
-							y_minibatch = ytr_shuf[:,(minibatch)*mini_batch_size:(minibatch+1)*mini_batch_size]
-
-							W_new,b_new = parameter_update(X_minibatch,y_minibatch,W,b,epsilon, alpha)
-							W = W_new
-							b = b_new
-							
-
-						costfn = cost_function(X_tr,ytr,W_new,b_new, alpha)
-
-						costfn_set.append(costfn)
-						x.append(epochs+1)
-
-						figure.canvas.restore_region(background)
-						ax.plot(x,costfn_set, color = 'black')
-						figure.canvas.blit(ax.bbox)
-						figure.canvas.flush_events()
-							
-					plt.cla()
-					
-
-
-					#####################
-					### Training ends ###
-					#####################
-			
-					valcostfn = cost_function(X_val,y_val,W,b, alpha)
-
-					# Display costs of validation and training set over terminal post training, given a hyperparameter set	
-					
-					print('cost function for epochs of', total_epochs," and mini_batch_size of ", mini_batch_size, " with alpha of ", alpha, "and epsilon of", epsilon, 'is: ', valcostfn)
-
-					print('cost with same hyperparameters on training set is: ', costfn)
-
-					#Store relevant weights in a dictionary corresponding to a key which contains information on the training set
-
-					key = str("Epochs : "+ str(total_epochs) + ", mini batch size : " + str(mini_batch_size) + ", alpha " + str(alpha) + ", epsilon : " + str(epsilon) )
-
-					Costs_wrt_hyp[key] = [valcostfn, W,b]
-
-				
-
-
-	
-	min_key = dictionary_minimum(Costs_wrt_hyp)
-
-	
-
-	return  Costs_wrt_hyp, min_key
+	print("time",start-end)
+									
+	return W,b,alpha_best,epsilon_best,epoch_best,batch_size_best
 
 
 
 if __name__ == '__main__':
 
-	Costs_wrt_hyp, min_key = train_regressor()
+	W,b,alpha_best,epsilon_best,epoch_best,batch_size_best = train_regressor()
 
-	print("Optimal hyperparameters set :", min_key)
+	print('Optimal params are -  epochs of', epoch_best," and mini_batch_size of ", batch_size_best, " with alpha of ",alpha_best, "and epsilon of", epsilon_best)
 
-	X_te = np.load("fashion_mnist_test_images.npy").T
+	X_te = np.load("fashion_mnist_test_images.npy").astype('float32')
 
 	X_te = X_te/255
-	yte = (np.load("fashion_mnist_test_labels.npy"))
+	yte = (np.load("fashion_mnist_test_labels.npy")).astype('int')
 
 	#Perform one hot encoding
-	yte = one_hotencoding(yte)
+	yte = one_hotencoding(yte).T.astype('float32')
 
 
 	#Find error on test set with optimal hyperparameter set and corresponding weights
 
-	test_set_cost = cost_function(X_te,yte,Costs_wrt_hyp[min_key][1],Costs_wrt_hyp[min_key][2], 0)
+	test_set_cost = cost_function(X_te,yte,W,b, 0)
 	print("Test set cost: ",test_set_cost)
 
 
 	#Find the accuracy
 
-	estimate_full = softmax(X_te,Costs_wrt_hyp[min_key][1],Costs_wrt_hyp[min_key][2]);
-	yte = yte.astype(int)
+	estimate_full = softmax(X_te,W,b);
+	yte = yte.T.astype(int)
+
+	print(np.shape(yte))
 
 
 	count = 0
@@ -296,18 +294,6 @@ if __name__ == '__main__':
 			count = count + 1
 
 	print("Accuracy : ", 100*count/np.shape(yte)[1])
-	
-
-	#saving the data
-
-	np.save('weights_FMNIST.npy',Costs_wrt_hyp[min_key][1])
-	np.save('bias_FMNIST.npy',Costs_wrt_hyp[min_key][2])
-
-	np.save('Costs_wrt_hyp.npy',  Costs_wrt_hyp)    
-
-	#my_dict_back = np.load('Costs_wrt_hyp.npy',allow_pickle=True)
-
-	#print(my_dict_back.item().get(min_key)[0])
 
 
 
